@@ -37,9 +37,6 @@ ChatGPT on WeChat项目插件, 使用jina reader和ChatGPT总结网页链接内�
 ```json
 {
     "jina_reader_base": "https://r.jina.ai",          # jina reader链接，默认为https://r.jina.ai
-    "open_ai_api_base": "https://api.openai.com/v1",  # chatgpt chat url
-    "open_ai_api_key": "sk-xxx",                      # chatgpt api key
-    "open_ai_model": "gpt-3.5-turbo",                 # chatgpt model
     "max_words": 8000,                                # 网页链接内容的最大字数，防止超过最大输入token
     "auto_sum": false,                                # 是否自动总结（仅群聊有效）
     "white_url_list": [],                             # url白名单, 列表为空时不做限制，黑名单优先级大于白名单
@@ -62,4 +59,4 @@ ChatGPT on WeChat项目插件, 使用jina reader和ChatGPT总结网页链接内�
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=hanfangyuan4396/jina_sum&type=Date)](https://star-history.com/#hanfangyuan4396/jina_sum&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=sofs2005/jina_sum&type=Date)](https://star-history.com/#sofs2005/jina_sum&Date)
