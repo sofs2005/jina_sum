@@ -194,7 +194,7 @@ class JinaSum(Plugin):
                 logger.debug(f"[JinaSum] {content} is not a valid url, skip")
                 return
                 
-            # 检缓存
+            # 检查缓存
             if content in self.summary_cache:
                 cache_data = self.summary_cache[content]
                 if time.time() - cache_data["timestamp"] <= self.summary_cache_timeout:
@@ -210,43 +210,62 @@ class JinaSum(Plugin):
                 channel = e_context["channel"]
                 channel.send(reply, e_context["context"])
 
+            # 获取网页内容
             target_url = html.unescape(content)
             jina_url = self._get_jina_url(target_url)
+            logger.debug(f"[JinaSum] Requesting jina url: {jina_url}")
+            
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-            response = requests.get(jina_url, headers=headers, timeout=60)
-            response.raise_for_status()
-            target_url_content = response.text
+            try:
+                response = requests.get(jina_url, headers=headers, timeout=60)
+                response.raise_for_status()
+                target_url_content = response.text
+                if not target_url_content:
+                    raise ValueError("Empty response from jina reader")
+            except Exception as e:
+                logger.error(f"[JinaSum] Failed to get content from jina reader: {str(e)}")
+                raise
             
-            openai_chat_url = self._get_openai_chat_url()
-            openai_headers = self._get_openai_headers()
-            openai_payload = self._get_openai_payload(target_url_content)
+            # 限制内容长度
+            target_url_content = target_url_content[:self.max_words]
+            logger.debug(f"[JinaSum] Got content length: {len(target_url_content)}")
             
-            response = requests.post(openai_chat_url, headers=openai_headers, json=openai_payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()['choices'][0]['message']['content']
-            result += f"\n\n💡 您可以在5分钟内发送「{self.qa_trigger}xxx」来询问文章相关问题"
+            # 构造提示词和内容
+            sum_prompt = f"{self.prompt}\n\n'''{target_url_content}'''"
             
-            # 缓存总结结果和原文内容
-            self.summary_cache[content] = {
-                "summary": result,
-                "timestamp": time.time()
-            }
+            # 修改 context 内容，传递给下一个插件处理
+            e_context['context'].type = ContextType.TEXT
+            e_context['context'].content = sum_prompt
             
-            # 使用原始URL作为key缓存原文内容
+            # 缓存原文内容用于后续问答
             self.content_cache[content] = {
                 "content": target_url_content,
                 "timestamp": time.time()
             }
             
-            reply = Reply(ReplyType.TEXT, result)
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
+            try:
+                # 确保设置一个默认的 reply，以防后续插件没有设置
+                default_reply = Reply(ReplyType.TEXT, "抱歉，处理过程中出现错误")
+                e_context["reply"] = default_reply
+                
+                # 继续传递给下一个插件处理
+                e_context.action = EventAction.CONTINUE
+                logger.debug(f"[JinaSum] Passing content to next plugin: length={len(sum_prompt)}")
+                return
+                
+            except Exception as e:
+                logger.warning(f"[JinaSum] Failed to handle context: {str(e)}")
+                # 如果出错，确保有一个 reply
+                error_reply = Reply(ReplyType.ERROR, "处理过程中出现错误")
+                e_context["reply"] = error_reply
+                e_context.action = EventAction.BREAK_PASS
             
         except Exception as e:
-            logger.error(f"[JinaSum] Error in processing summary: {str(e)}")
+            logger.error(f"[JinaSum] Error in processing summary: {str(e)}", exc_info=True)
             if retry_count < 3:
+                logger.info(f"[JinaSum] Retrying {retry_count + 1}/3...")
                 return self._process_summary(content, e_context, retry_count + 1)
-            reply = Reply(ReplyType.ERROR, f"无法获取总结该内容: {str(e)}")
+            reply = Reply(ReplyType.ERROR, f"无法获取该内容: {str(e)}")
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
 
