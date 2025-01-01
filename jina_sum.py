@@ -18,7 +18,7 @@ from plugins import *
     desire_priority=10,
     hidden=False,
     desc="Sum url link content with jina reader and llm",
-    version="1.0.1",
+    version="1.1.0",
     author="sofs2005",
 )
 class JinaSum(Plugin):
