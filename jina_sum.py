@@ -15,7 +15,7 @@ from plugins import *
 
 @plugins.register(
     name="JinaSum",
-    desire_priority=10,
+    desire_priority=20,
     hidden=False,
     desc="Sum url link content with jina reader and llm",
     version="1.1.0",
