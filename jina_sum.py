@@ -121,7 +121,7 @@ class JinaSum(Plugin):
                     cached_content = self.pending_messages[chat_id]["content"]
                     logger.debug(f"[JinaSum] Processing cached content: {cached_content}")
                     del self.pending_messages[chat_id]
-                    return self._process_summary(cached_content, e_context, retry_count=0)
+                    return self._process_summary(cached_content, e_context, retry_count=0, skip_notice=True)
                 
                 # 检查是否是直接URL总结，移除"总结"并检查剩余内容是否为URL
                 url = content.replace("总结", "").strip()
@@ -146,14 +146,21 @@ class JinaSum(Plugin):
         for k in expired_keys:
             del self.pending_messages[k]
 
-    def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0):
-        """处理总结请求"""
+    def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0, skip_notice: bool = False):
+        """处理总结请求
+        
+        Args:
+            content: 要处理的内容
+            e_context: 事件上下文
+            retry_count: 重试次数
+            skip_notice: 是否跳过提示消息
+        """
         try:
             if not self._check_url(content):
                 logger.debug(f"[JinaSum] {content} is not a valid url, skip")
                 return
                 
-            if retry_count == 0:
+            if retry_count == 0 and not skip_notice:
                 logger.debug("[JinaSum] Processing URL: %s" % content)
                 reply = Reply(ReplyType.TEXT, "🎉正在为您生成总结，请稍候...")
                 channel = e_context["channel"]
