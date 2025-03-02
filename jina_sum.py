@@ -2,6 +2,7 @@
 import json
 import os
 import html
+import re
 from urllib.parse import urlparse
 import time
 
@@ -18,7 +19,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="Sum url link content with jina reader and llm",
-    version="1.1.0",
+    version="1.1.1",
     author="sofs2005",
 )
 class JinaSum(Plugin):
@@ -181,6 +182,9 @@ class JinaSum(Plugin):
             except Exception as e:
                 logger.error(f"[JinaSum] Failed to get content from jina reader: {str(e)}")
                 raise
+            
+            # 清洗内容，去除图片、链接、广告等无用信息
+            target_url_content = self._clean_content(target_url_content)
             
             # 限制内容长度
             target_url_content = target_url_content[:self.max_words]
@@ -347,3 +351,78 @@ class JinaSum(Plugin):
                 return False
 
         return True
+
+    def _clean_content(self, content: str) -> str:
+        """清洗内容，去除图片、链接、广告等无用信息
+        
+        Args:
+            content: 原始内容
+            
+        Returns:
+            str: 清洗后的内容
+        """
+        # 记录原始长度
+        original_length = len(content)
+        logger.debug(f"[JinaSum] Original content length: {original_length}")
+        
+        # 移除Markdown图片标签
+        content = re.sub(r'!\[.*?\]\(.*?\)', '', content)
+        content = re.sub(r'\[!\[.*?\]\(.*?\)', '', content)  # 嵌套图片标签
+        
+        # 移除图片描述 (通常在方括号或特定格式中)
+        content = re.sub(r'\[图片\]|\[image\]|\[img\]|\[picture\]', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'\[.*?图片.*?\]', '', content)
+        
+        # 移除阅读时间、字数等元数据
+        content = re.sub(r'本文字数：\d+，阅读时长大约\d+分钟', '', content)
+        content = re.sub(r'阅读时长[:：].*?分钟', '', content)
+        content = re.sub(r'字数[:：]\d+', '', content)
+        
+        # 移除日期标记和时间戳
+        content = re.sub(r'\d{4}[\.年/-]\d{1,2}[\.月/-]\d{1,2}[日号]?(\s+\d{1,2}:\d{1,2}(:\d{1,2})?)?', '', content)
+        
+        # 移除分隔线
+        content = re.sub(r'\*\s*\*\s*\*', '', content)
+        content = re.sub(r'-{3,}', '', content)
+        content = re.sub(r'_{3,}', '', content)
+        
+        # 移除网页中常见的广告标记
+        ad_patterns = [
+            r'广告\s*[\.。]?', 
+            r'赞助内容', 
+            r'sponsored content',
+            r'advertisement',
+            r'promoted content',
+            r'推广信息',
+            r'\[广告\]',
+            r'【广告】',
+        ]
+        for pattern in ad_patterns:
+            content = re.sub(pattern, '', content, flags=re.IGNORECASE)
+        
+        # 移除URL链接和空的Markdown链接
+        content = re.sub(r'https?://\S+', '', content)
+        content = re.sub(r'www\.\S+', '', content)
+        content = re.sub(r'\[\]\(.*?\)', '', content)  # 空链接引用 [](...)
+        content = re.sub(r'\[.+?\]\(\s*\)', '', content)  # 有文本无链接 [text]()
+        
+        # 清理Markdown格式但保留文本内容
+        content = re.sub(r'\*\*(.+?)\*\*', r'\1', content)  # 移除加粗标记但保留内容
+        content = re.sub(r'\*(.+?)\*', r'\1', content)      # 移除斜体标记但保留内容
+        content = re.sub(r'`(.+?)`', r'\1', content)        # 移除代码标记但保留内容
+        
+        # 清理文章尾部的"微信编辑"和"推荐阅读"等无关内容
+        content = re.sub(r'\*\*微信编辑\*\*.*?$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'\*\*推荐阅读\*\*.*?$', '', content, flags=re.MULTILINE | re.DOTALL)
+        
+        # 清理多余的空白字符
+        content = re.sub(r'\n{3,}', '\n\n', content)  # 移除多余空行
+        content = re.sub(r'\s{2,}', ' ', content)     # 移除多余空格
+        content = re.sub(r'^\s+', '', content, flags=re.MULTILINE)  # 移除行首空白
+        content = re.sub(r'\s+$', '', content, flags=re.MULTILINE)  # 移除行尾空白
+        
+        # 记录清洗后长度
+        cleaned_length = len(content)
+        logger.debug(f"[JinaSum] Cleaned content length: {cleaned_length}, removed {original_length - cleaned_length} characters")
+        
+        return content
