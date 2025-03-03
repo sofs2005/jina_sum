@@ -1,7 +1,10 @@
 {
   "jina_reader_base": "https://r.jina.ai",
-  "max_words": 8000,
-  "auto_sum": false,
+  "open_ai_api_base": "https://api.siliconflow.cn/v1",   
+  "open_ai_api_key":  "sk-runyopstymaxgzjwtcvtguhyvpldufewycedwbdgbjolevdi",                      
+  "open_ai_model": "deepseek-ai/DeepSeek-V3",                  
+  "max_words": 30000,
+  "auto_sum": true,
   "white_url_list": [],
   "black_url_list": [
     "https://support.weixin.qq.com",
