@@ -3,7 +3,7 @@ import json
 import os
 import html
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import time
 
 import requests
@@ -305,7 +305,14 @@ class JinaSum(Plugin):
             logger.exception(e)
 
     def _get_jina_url(self, target_url):
-        return self.jina_reader_base + "/" + target_url
+        # 只对微信公众号链接做特殊处理
+        if "mp.weixin.qq.com" in target_url:
+            # 使用完全编码的方式处理微信URL
+            encoded_url = quote(target_url)
+            return self.jina_reader_base + "/" + encoded_url
+        else:
+            # 其他网站保持原有处理方式
+            return self.jina_reader_base + "/" + target_url
 
     def _get_openai_chat_url(self):
         return self.open_ai_api_base + "/chat/completions"
