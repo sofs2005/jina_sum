@@ -122,7 +122,7 @@ class JinaSum(Plugin):
                     cached_content = self.pending_messages[chat_id]["content"]
                     logger.debug(f"[JinaSum] Processing cached content: {cached_content}")
                     del self.pending_messages[chat_id]
-                    return self._process_summary(cached_content, e_context, retry_count=0, skip_notice=True)
+                    return self._process_summary(cached_content, e_context, retry_count=0, skip_notice=False)
                 
                 # 检查是否是直接URL总结，移除"总结"并检查剩余内容是否为URL
                 url = content.replace("总结", "").strip()
