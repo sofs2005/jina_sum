@@ -7,6 +7,8 @@ from urllib.parse import urlparse, quote
 import time
 
 import requests
+from newspaper import Article
+import newspaper
 
 import plugins
 from bridge.context import ContextType
@@ -18,8 +20,8 @@ from plugins import *
     name="JinaSum",
     desire_priority=20,
     hidden=False,
-    desc="Sum url link content with jina reader and llm",
-    version="1.1.1",
+    desc="Sum url link content with llm",
+    version="2.0",
     author="sofs2005",
 )
 class JinaSum(Plugin):
@@ -147,15 +149,80 @@ class JinaSum(Plugin):
         for k in expired_keys:
             del self.pending_messages[k]
 
-    def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0, skip_notice: bool = False):
-        """处理总结请求
+    def _get_content_via_api(self, url):
+        """通过API服务获取微信公众号内容
+        
+        当jina直接访问失败时，使用此备用方法
         
         Args:
-            content: 要处理的内容
-            e_context: 事件上下文
-            retry_count: 重试次数
-            skip_notice: 是否跳过提示消息
+            url: 微信文章URL
+            
+        Returns:
+            str: 文章内容
         """
+        try:
+            # 简单的API调用，参考sum4all插件实现
+            api_url = "https://ai.sum4all.site"
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                "link": url,
+                "prompt": "",  # 不需要总结，只获取内容
+            }
+            
+            logger.debug(f"[JinaSum] Trying to get content via API: {url}")
+            response = requests.post(api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            
+            response_data = response.json()
+            if response_data.get("success"):
+                # 从API返回中提取原始内容
+                content = response_data.get("content", "")
+                if content:
+                    logger.debug(f"[JinaSum] Successfully got content via API, length: {len(content)}")
+                    return content
+            
+            logger.error(f"[JinaSum] API returned failure or empty content")
+            return None
+        except Exception as e:
+            logger.error(f"[JinaSum] Error getting content via API: {str(e)}")
+            return None
+
+    def _get_content_via_newspaper(self, url):
+        """使用newspaper3k库提取文章内容
+        
+        Args:
+            url: 文章URL
+            
+        Returns:
+            str: 文章内容,失败返回None
+        """
+        try:
+            # 配置newspaper
+            newspaper.Config().browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            newspaper.Config().request_timeout = 20
+            
+            # 创建Article对象并下载
+            article = Article(url, language='zh')
+            article.download()
+            article.parse()
+            
+            # 获取内容
+            content = article.text
+            if not content:
+                logger.debug("[JinaSum] No content extracted by newspaper")
+                return None
+                
+            logger.debug(f"[JinaSum] Successfully extracted content via newspaper, length: {len(content)}")
+            return content
+            
+        except Exception as e:
+            logger.error(f"[JinaSum] Error extracting content via newspaper: {str(e)}")
+            return None
+
+    def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0, skip_notice: bool = False):
+        """处理总结请求"""
         try:
             if not self._check_url(content):
                 logger.debug(f"[JinaSum] {content} is not a valid url, skip")
@@ -169,21 +236,42 @@ class JinaSum(Plugin):
 
             # 获取网页内容
             target_url = html.unescape(content)
-            jina_url = self._get_jina_url(target_url)
-            logger.debug(f"[JinaSum] Requesting jina url: {jina_url}")
+            target_url_content = None
             
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-            try:
-                response = requests.get(jina_url, headers=headers, timeout=60)
-                response.raise_for_status()
-                target_url_content = response.text
-                if not target_url_content:
-                    raise ValueError("Empty response from jina reader")
-            except Exception as e:
-                logger.error(f"[JinaSum] Failed to get content from jina reader: {str(e)}")
-                raise
+            # 1. 首先尝试使用newspaper提取
+            target_url_content = self._get_content_via_newspaper(target_url)
             
-            # 清洗内容，去除图片、链接、广告等无用信息
+            # 2. 如果newspaper失败,对于微信文章尝试其他方法
+            if not target_url_content and "mp.weixin.qq.com" in target_url:
+                try:
+                    # 尝试jina方法
+                    jina_url = self._get_jina_url(target_url)
+                    logger.debug(f"[JinaSum] Requesting jina url: {jina_url}")
+                    
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+                    response = requests.get(jina_url, headers=headers, timeout=60)
+                    response.raise_for_status()
+                    target_url_content = response.text
+                    
+                    if not target_url_content or len(target_url_content) < 1000:
+                        # 内容太少,尝试API方法
+                        logger.debug(f"[JinaSum] Content from jina too short ({len(target_url_content)} chars), trying API")
+                        api_content = self._get_content_via_api(target_url)
+                        if api_content:
+                            target_url_content = api_content
+                    
+                except Exception as e:
+                    logger.error(f"[JinaSum] Failed to get content from jina reader: {str(e)}")
+                    # 尝试API方法
+                    api_content = self._get_content_via_api(target_url)
+                    if api_content:
+                        target_url_content = api_content
+            
+            # 如果所有方法都失败
+            if not target_url_content:
+                raise ValueError("无法提取文章内容")
+                
+            # 清洗内容
             target_url_content = self._clean_content(target_url_content)
             
             # 限制内容长度
@@ -193,12 +281,12 @@ class JinaSum(Plugin):
             # 构造提示词和内容
             sum_prompt = f"{self.prompt}\n\n'''{target_url_content}'''"
             
-            # 修改 context 内容，传递给下一个插件处理
+            # 修改context内容
             e_context['context'].type = ContextType.TEXT
             e_context['context'].content = sum_prompt
             
             try:
-                # 确保设置一个默认的 reply，以防后续插件没有设置
+                # 设置默认reply
                 default_reply = Reply(ReplyType.TEXT, "抱歉，处理过程中出现错误")
                 e_context["reply"] = default_reply
                 
@@ -209,17 +297,27 @@ class JinaSum(Plugin):
                 
             except Exception as e:
                 logger.warning(f"[JinaSum] Failed to handle context: {str(e)}")
-                # 如果出错，确保有一个 reply
                 error_reply = Reply(ReplyType.ERROR, "处理过程中出现错误")
                 e_context["reply"] = error_reply
                 e_context.action = EventAction.BREAK_PASS
-            
+                
         except Exception as e:
-            logger.error(f"[JinaSum] Error in processing summary: {str(e)}", exc_info=True)
+            logger.error(f"[JinaSum] Error in processing summary: {str(e)}")
             if retry_count < 3:
                 logger.info(f"[JinaSum] Retrying {retry_count + 1}/3...")
                 return self._process_summary(content, e_context, retry_count + 1)
-            reply = Reply(ReplyType.ERROR, f"无法获取该内容: {str(e)}")
+            
+            # 友好的错误提示
+            error_msg = "抱歉，无法获取文章内容。可能是因为:\n"
+            error_msg += "1. 文章需要登录或已过期\n"
+            error_msg += "2. 文章有特殊的访问限制\n"
+            error_msg += "3. 网络连接不稳定\n\n"
+            error_msg += "建议您:\n"
+            error_msg += "- 直接打开链接查看\n"
+            error_msg += "- 稍后重试\n"
+            error_msg += "- 尝试其他文章"
+            
+            reply = Reply(ReplyType.ERROR, error_msg)
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
 
@@ -307,8 +405,22 @@ class JinaSum(Plugin):
     def _get_jina_url(self, target_url):
         # 只对微信公众号链接做特殊处理
         if "mp.weixin.qq.com" in target_url:
-            # 使用完全编码的方式处理微信URL
-            encoded_url = quote(target_url)
+            # 清理微信URL，只保留核心参数
+            import re
+            # 提取核心参数：__biz, mid, idx, sn
+            biz_match = re.search(r'__biz=([^&]+)', target_url)
+            mid_match = re.search(r'mid=([^&]+)', target_url)
+            idx_match = re.search(r'idx=([^&]+)', target_url)
+            sn_match = re.search(r'sn=([^&]+)', target_url)
+            
+            if biz_match and mid_match and idx_match and sn_match:
+                # 构建简化的URL
+                clean_url = f"http://mp.weixin.qq.com/s?__biz={biz_match.group(1)}&mid={mid_match.group(1)}&idx={idx_match.group(1)}&sn={sn_match.group(1)}"
+                logger.debug(f"[JinaSum] Simplified WeChat URL: {clean_url}")
+                target_url = clean_url
+            
+            # 对整个URL进行完全编码，不保留任何特殊字符
+            encoded_url = quote(target_url, safe='')
             return self.jina_reader_base + "/" + encoded_url
         else:
             # 其他网站保持原有处理方式

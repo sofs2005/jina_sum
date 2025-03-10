@@ -1,7 +1,9 @@
-# jina_sumary
-ChatGPT on WeChat项目插件, 使用jina reader和ChatGPT总结网页链接内容
+# JinaSum
+Dify on WeChat项目插件, 使用newspaper3k和ChatGPT总结网页链接内容
 
-支持总结公众号、小红书、csdn等分享卡片链接(有的卡片链接会触发验证，一般直链没有此问题)
+> 注: 由于微信政策调整,jina reader已无法获取微信公众号文章内容。本插件已更新为使用newspaper3k库直接提取文章内容,但出于历史原因仍保留JinaSum的名称。
+
+支持总结公众号、小红书、csdn等分享卡片链接。
 
 ## 功能
 - 支持自动总结微信文章
@@ -36,7 +38,6 @@ ChatGPT on WeChat项目插件, 使用jina reader和ChatGPT总结网页链接内�
 ## 配置说明
 ```json
 {
-    "jina_reader_base": "https://r.jina.ai",          # jina reader链接，默认为https://r.jina.ai
     "max_words": 8000,                                # 网页链接内容的最大字数，防止超过最大输入token
     "auto_sum": false,                                # 是否自动总结（仅群聊有效）
     "white_url_list": [],                             # url白名单, 列表为空时不做限制，黑名单优先级大于白名单
@@ -51,7 +52,7 @@ ChatGPT on WeChat项目插件, 使用jina reader和ChatGPT总结网页链接内�
 ```
 
 ## 注意事项
-1. 需要配置 jina reader 链接
+1. 插件现已使用newspaper3k库提取文章内容,不再依赖jina reader
 2. 群聊中需要@机器人触发总结
 3. 支持的文章来源：微信公众号、知乎、简书等主流平台
 4. 黑名单群组配置使用群名，不是群ID
