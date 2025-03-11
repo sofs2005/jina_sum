@@ -311,7 +311,14 @@ class JinaSum(Plugin):
                 # 先获取重定向后的真实URL
                 try:
                     logger.debug(f"[JinaSum] Resolving B站短链接: {url}")
-                    response = requests.head(url, allow_redirects=True, timeout=10)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Cache-Control": "max-age=0",
+                        "Connection": "keep-alive"
+                    }
+                    response = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
                     if response.status_code == 200:
                         real_url = response.url
                         logger.debug(f"[JinaSum] B站短链接解析结果: {real_url}")
@@ -319,16 +326,125 @@ class JinaSum(Plugin):
                 except Exception as e:
                     logger.error(f"[JinaSum] 解析B站短链接失败: {str(e)}")
             
+            # 增强模拟真实浏览器访问
+            import random
+            
+            # 随机选择一个User-Agent，模拟不同浏览器
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            ]
+            selected_ua = random.choice(user_agents)
+            
+            # 构建更真实的请求头
+            headers = {
+                "User-Agent": selected_ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0"
+            }
+            
+            # 设置一个随机的引荐来源，微信文章有时需要Referer
+            referers = [
+                "https://www.baidu.com/",
+                "https://www.google.com/",
+                "https://www.bing.com/",
+                "https://mp.weixin.qq.com/",
+                "https://weixin.qq.com/",
+                "https://www.qq.com/"
+            ]
+            if random.random() > 0.3:  # 70%的概率添加Referer
+                headers["Referer"] = random.choice(referers)
+                
+            # 为微信公众号文章添加特殊处理
+            if "mp.weixin.qq.com" in url:
+                try:
+                    # 添加必要的微信Cookie参数，减少被检测的可能性
+                    cookies = {
+                        "appmsglist_action_3941382959": "card",  # 一些随机的Cookie值
+                        "appmsglist_action_3941382968": "card",
+                        "pac_uid": f"{int(time.time())}_f{random.randint(10000, 99999)}",
+                        "rewardsn": "",
+                        "wxtokenkey": f"{random.randint(100000, 999999)}",
+                    }
+                    
+                    # 直接使用requests进行内容获取，有时比newspaper更有效
+                    session = requests.Session()
+                    response = session.get(url, headers=headers, cookies=cookies, timeout=20)
+                    response.raise_for_status()
+                    
+                    # 使用BeautifulSoup直接解析
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # 微信文章通常有这些特征
+                    title_elem = soup.select_one('#activity-name')
+                    author_elem = soup.select_one('#js_name') or soup.select_one('#js_profile_qrcode > div > strong')
+                    content_elem = soup.select_one('#js_content')
+                    
+                    if content_elem:
+                        # 移除无用元素
+                        for remove_elem in content_elem.select('script, style, svg'):
+                            remove_elem.extract()
+                            
+                        # 尝试获取所有文本
+                        text_content = content_elem.get_text(separator='\n', strip=True)
+                        
+                        if text_content and len(text_content) > 200:  # 内容足够长
+                            title = title_elem.get_text(strip=True) if title_elem else ""
+                            author = author_elem.get_text(strip=True) if author_elem else "未知作者"
+                            
+                            # 构建完整内容
+                            full_content = ""
+                            if title:
+                                full_content += f"标题: {title}\n"
+                            if author and author != "未知作者":
+                                full_content += f"作者: {author}\n"
+                            full_content += f"\n{text_content}"
+                            
+                            logger.debug(f"[JinaSum] 成功通过直接请求提取微信文章内容，长度: {len(text_content)}")
+                            return full_content
+                except Exception as e:
+                    logger.error(f"[JinaSum] 直接请求提取微信文章失败: {str(e)}")
+                    # 失败后使用newspaper尝试，不要返回
+            
             # 配置newspaper
-            newspaper.Config().browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            newspaper.Config().browser_user_agent = selected_ua
             newspaper.Config().request_timeout = 30
             newspaper.Config().fetch_images = False  # 不下载图片以加快速度
             newspaper.Config().memoize_articles = False  # 避免缓存导致的问题
             
-            # 创建Article对象并下载
-            article = Article(url, language='zh')
-            article.download()
-            article.parse()
+            # 对newspaper的下载过程进行定制
+            try:
+                # 创建Article对象但不立即下载
+                article = Article(url, language='zh')
+                
+                # 手动下载
+                session = requests.Session()
+                response = session.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                # 手动设置html内容
+                article.html = response.text
+                article.download_state = 2  # 表示下载完成
+                
+                # 然后解析
+                article.parse()
+            except Exception as direct_dl_error:
+                logger.error(f"[JinaSum] 尝试定制下载失败，回退到标准方法: {str(direct_dl_error)}")
+                article = Article(url, language='zh')
+                article.download()
+                article.parse()
             
             # 尝试获取完整内容
             title = article.title
@@ -336,10 +452,11 @@ class JinaSum(Plugin):
             publish_date = article.publish_date.strftime("%Y-%m-%d") if article.publish_date else "未知日期"
             content = article.text
             
-            # 如果内容为空，尝试直接从HTML获取
+            # 如果内容为空或过短，尝试直接从HTML获取
             if not content or len(content) < 500:
                 logger.debug("[JinaSum] Article content too short, trying to extract from HTML directly")
                 try:
+                    from bs4 import BeautifulSoup
                     soup = BeautifulSoup(article.html, 'html.parser')
                     
                     # 移除脚本和样式元素
@@ -347,7 +464,7 @@ class JinaSum(Plugin):
                         script.extract()
                     
                     # 获取所有文本
-                    text = soup.get_text(separator=' ', strip=True)
+                    text = soup.get_text(separator='\n', strip=True)
                     
                     # 如果直接提取的内容更长，使用它
                     if len(text) > len(content):
@@ -367,7 +484,7 @@ class JinaSum(Plugin):
             else:
                 full_content = content
             
-            if not full_content:
+            if not full_content or len(full_content.strip()) < 50:
                 logger.debug("[JinaSum] No content extracted by newspaper")
                 return None
             
@@ -382,6 +499,8 @@ class JinaSum(Plugin):
             
         except Exception as e:
             logger.error(f"[JinaSum] Error extracting content via newspaper: {str(e)}")
+            if "mp.weixin.qq.com" in url:
+                return f"无法获取微信公众号文章内容。可能原因：\n1. 文章需要登录才能查看\n2. 文章已被删除\n3. 服务器被微信风控\n\n请尝试直接打开链接: {url}"
             return None
 
     def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0, skip_notice: bool = False):
@@ -406,6 +525,10 @@ class JinaSum(Plugin):
                 logger.warning("[JinaSum] 检测到XML数据而不是URL，尝试提取真实URL")
                 try:
                     import xml.etree.ElementTree as ET
+                    # 处理可能的XML声明
+                    if target_url.startswith('<?xml'):
+                        target_url = target_url[target_url.find('<msg>'):]
+                    
                     root = ET.fromstring(target_url)
                     url_elem = root.find(".//url")
                     if url_elem is not None and url_elem.text:
@@ -421,6 +544,15 @@ class JinaSum(Plugin):
             # 使用newspaper3k提取内容
             logger.debug(f"[JinaSum] 使用newspaper3k提取内容: {target_url}")
             target_url_content = self._get_content_via_newspaper(target_url)
+            
+            # 检查返回的内容是否包含验证提示
+            if target_url_content and target_url_content.startswith("⚠️"):
+                # 这是一个验证提示，直接返回给用户
+                logger.info(f"[JinaSum] 返回验证提示给用户: {target_url_content}")
+                reply = Reply(ReplyType.INFO, target_url_content)
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
             
             # 如果newspaper提取失败，尝试使用API
             if not target_url_content:
