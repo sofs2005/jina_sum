@@ -9,6 +9,7 @@ import time
 import requests
 from newspaper import Article
 import newspaper
+from bs4 import BeautifulSoup
 
 import plugins
 from bridge.context import ContextType
@@ -20,8 +21,8 @@ from plugins import *
     name="JinaSum",
     desire_priority=20,
     hidden=False,
-    desc="Sum url link content with llm",
-    version="2.0",
+    desc="Sum url link content with newspaper3k and llm",
+    version="2.1",
     author="sofs2005",
 )
 class JinaSum(Plugin):
@@ -35,7 +36,6 @@ class JinaSum(Plugin):
     """
     # 默认配置
     DEFAULT_CONFIG = {
-        "jina_reader_base": "https://r.jina.ai",
         "max_words": 8000,
         "prompt": "我需要对下面引号内文档进行总结，总结输出包括以下三个部分：\n📖 一句话总结\n🔑 关键要点,用数字序号列出3-5个文章的核心内容\n🏷 标签: #xx #xx\n请使用emoji让你的表达更生动\n\n",
         "white_url_list": [],
@@ -49,29 +49,60 @@ class JinaSum(Plugin):
     }
 
     def __init__(self):
-        super().__init__()
+        """初始化插件配置"""
         try:
+            super().__init__()
+            
+            # 确保使用默认配置初始化
             self.config = super().load_config()
             if not self.config:
                 self.config = self._load_config_template()
             
             # 使用默认配置初始化
             for key, default_value in self.DEFAULT_CONFIG.items():
-                setattr(self, key, self.config.get(key, default_value))
+                if key not in self.config:
+                    self.config[key] = default_value
             
-            # 每次启动时重置缓存
-            self.pending_messages = {}  # 待处理消息缓存
+            # 设置配置参数
+            self.max_words = self.config.get("max_words", 8000)
+            self.prompt = self.config.get("prompt", "我需要对下面引号内文档进行总结...")
+            self.cache_timeout = self.config.get("cache_timeout", 300)  # 默认5分钟
             
-            logger.info(f"[JinaSum] inited, config={self.config}")
+            # URL黑白名单配置
+            self.white_url_list = self.config.get("white_url_list", [])
+            self.black_url_list = self.config.get("black_url_list", [])
+            self.black_group_list = self.config.get("black_group_list", [])
+            
+            # 是否自动总结（仅群聊有效）
+            self.auto_sum = self.config.get("auto_sum", False)
+            
+            # 消息缓存
+            self.pending_messages = {}  # 用于存储待处理的消息，格式: {chat_id: {"content": content, "timestamp": time.time()}}
+            
+            # API 设置
+            self.open_ai_api_base = "https://api.openai.com/v1"
+            self.open_ai_model = "gpt-3.5-turbo"
+            
+            logger.info(f"[JinaSum] 初始化完成, config={self.config}")
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
         except Exception as e:
-            logger.error(f"[JinaSum] 初始化异常：{e}")
-            raise "[JinaSum] init failed, ignore "
+            logger.error(f"[JinaSum] 初始化异常：{str(e)}", exc_info=True)
+            raise Exception("[JinaSum] 初始化失败")
 
     def on_handle_context(self, e_context: EventContext):
         """处理消息"""
         context = e_context['context']
+        logger.info(f"[JinaSum] 收到消息, 类型={context.type}, 内容长度={len(context.content)}")
+
+        # 首先在日志中记录完整的消息内容，便于调试
+        orig_content = context.content
+        if len(orig_content) > 500:
+            logger.info(f"[JinaSum] 消息内容(截断): {orig_content[:500]}...")
+        else:
+            logger.info(f"[JinaSum] 消息内容: {orig_content}")
+        
         if context.type not in [ContextType.TEXT, ContextType.SHARING]:
+            logger.info(f"[JinaSum] 消息类型不符合处理条件，跳过: {context.type}")
             return
 
         content = context.content
@@ -79,6 +110,72 @@ class JinaSum(Plugin):
         msg = e_context['context']['msg']
         chat_id = msg.from_user_id
         is_group = msg.is_group
+        
+        # 打印前50个字符用于调试
+        preview = content[:50] + "..." if len(content) > 50 else content
+        logger.info(f"[JinaSum] 处理消息: {preview}, 类型={context.type}")
+
+        # 检查内容是否为XML格式（哔哩哔哩等第三方分享卡片）
+        if content.startswith('<?xml') or (content.startswith('<msg>') and '<appmsg' in content) or ('<appmsg' in content and '<url>' in content):
+            logger.info("[JinaSum] 检测到XML格式分享卡片，尝试提取URL")
+            try:
+                import xml.etree.ElementTree as ET
+                # 处理可能的XML声明
+                if content.startswith('<?xml'):
+                    content = content[content.find('<msg>'):]
+                
+                # 如果不是完整的XML，尝试添加根节点
+                if not content.startswith('<msg') and '<appmsg' in content:
+                    content = f"<msg>{content}</msg>"
+                
+                # 对于一些可能格式不标准的XML，使用更宽松的解析方式
+                try:
+                    root = ET.fromstring(content)
+                except ET.ParseError:
+                    # 尝试用正则表达式提取URL
+                    import re
+                    url_match = re.search(r'<url>(.*?)</url>', content)
+                    if url_match:
+                        extracted_url = url_match.group(1)
+                        logger.info(f"[JinaSum] 通过正则表达式从XML中提取到URL: {extracted_url}")
+                        content = extracted_url
+                        context.type = ContextType.SHARING
+                        context.content = extracted_url
+                    else:
+                        logger.error("[JinaSum] 无法通过正则表达式从XML中提取URL")
+                        return
+                else:
+                    # XML解析成功
+                    url_elem = root.find('.//url')
+                    title_elem = root.find('.//title')
+                    
+                    # 检查是否有appinfo节点，判断是否为B站等特殊应用
+                    appinfo = root.find('.//appinfo')
+                    app_name = None
+                    if appinfo is not None and appinfo.find('appname') is not None:
+                        app_name = appinfo.find('appname').text
+                        logger.info(f"[JinaSum] 检测到APP分享: {app_name}")
+                    
+                    logger.info(f"[JinaSum] XML解析结果: url_elem={url_elem is not None}, title_elem={title_elem is not None}, app_name={app_name}")
+                    
+                    if url_elem is not None and url_elem.text:
+                        # 提取到URL，将类型修改为SHARING
+                        extracted_url = url_elem.text
+                        logger.info(f"[JinaSum] 从XML中提取到URL: {extracted_url}")
+                        content = extracted_url
+                        context.type = ContextType.SHARING
+                        context.content = extracted_url
+                        
+                        # 对于B站视频链接，记录额外信息
+                        if app_name and ("哔哩哔哩" in app_name or "bilibili" in app_name.lower() or "b站" in app_name):
+                            logger.info("[JinaSum] 检测到B站视频分享")
+                            # 可以在这里添加B站视频的特殊处理逻辑
+                    else:
+                        logger.error("[JinaSum] 无法从XML中提取URL")
+                        return
+            except Exception as e:
+                logger.error(f"[JinaSum] 解析XML失败: {str(e)}", exc_info=True)
+                return
 
         # 检查是否需要自动总结
         should_auto_sum = self.auto_sum
@@ -130,10 +227,20 @@ class JinaSum(Plugin):
                 url = content.replace("总结", "").strip()
                 if url and self._check_url(url):
                     logger.debug(f"[JinaSum] Processing direct URL: {url}")
-                    return self._process_summary(url, e_context, retry_count=0)
+                    return self._process_summary(url, e_context, retry_count=0, skip_notice=False)
                 logger.debug("[JinaSum] No content to summarize")
                 return
-            
+
+            # 处理"问xxx"格式的追问
+            if content.startswith("问"):
+                question = content[1:].strip()
+                if question:
+                    logger.debug(f"[JinaSum] Processing question: {question}")
+                    return self._process_question(question, chat_id, e_context)
+                else:
+                    logger.debug("[JinaSum] Empty question, ignored")
+                    return
+                    
             # 单聊中直接处理URL
             if not is_group and self._check_url(content):
                 return self._process_summary(content, e_context, retry_count=0)
@@ -199,23 +306,79 @@ class JinaSum(Plugin):
             str: 文章内容,失败返回None
         """
         try:
+            # 处理B站短链接
+            if "b23.tv" in url:
+                # 先获取重定向后的真实URL
+                try:
+                    logger.debug(f"[JinaSum] Resolving B站短链接: {url}")
+                    response = requests.head(url, allow_redirects=True, timeout=10)
+                    if response.status_code == 200:
+                        real_url = response.url
+                        logger.debug(f"[JinaSum] B站短链接解析结果: {real_url}")
+                        url = real_url
+                except Exception as e:
+                    logger.error(f"[JinaSum] 解析B站短链接失败: {str(e)}")
+            
             # 配置newspaper
             newspaper.Config().browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            newspaper.Config().request_timeout = 20
+            newspaper.Config().request_timeout = 30
+            newspaper.Config().fetch_images = False  # 不下载图片以加快速度
+            newspaper.Config().memoize_articles = False  # 避免缓存导致的问题
             
             # 创建Article对象并下载
             article = Article(url, language='zh')
             article.download()
             article.parse()
             
-            # 获取内容
+            # 尝试获取完整内容
+            title = article.title
+            authors = ', '.join(article.authors) if article.authors else "未知作者"
+            publish_date = article.publish_date.strftime("%Y-%m-%d") if article.publish_date else "未知日期"
             content = article.text
-            if not content:
+            
+            # 如果内容为空，尝试直接从HTML获取
+            if not content or len(content) < 500:
+                logger.debug("[JinaSum] Article content too short, trying to extract from HTML directly")
+                try:
+                    soup = BeautifulSoup(article.html, 'html.parser')
+                    
+                    # 移除脚本和样式元素
+                    for script in soup(["script", "style"]):
+                        script.extract()
+                    
+                    # 获取所有文本
+                    text = soup.get_text(separator=' ', strip=True)
+                    
+                    # 如果直接提取的内容更长，使用它
+                    if len(text) > len(content):
+                        content = text
+                        logger.debug(f"[JinaSum] Using BeautifulSoup extracted content: {len(content)} chars")
+                except Exception as bs_error:
+                    logger.error(f"[JinaSum] BeautifulSoup extraction failed: {str(bs_error)}")
+            
+            # 合成最终内容
+            if title:
+                full_content = f"标题: {title}\n"
+                if authors and authors != "未知作者":
+                    full_content += f"作者: {authors}\n"
+                if publish_date and publish_date != "未知日期":
+                    full_content += f"发布日期: {publish_date}\n"
+                full_content += f"\n{content}"
+            else:
+                full_content = content
+            
+            if not full_content:
                 logger.debug("[JinaSum] No content extracted by newspaper")
                 return None
-                
-            logger.debug(f"[JinaSum] Successfully extracted content via newspaper, length: {len(content)}")
-            return content
+            
+            # 对于B站视频，尝试获取视频描述
+            if "bilibili.com" in url or "b23.tv" in url:
+                if title and not content:
+                    # 如果只有标题没有内容，至少返回标题
+                    return f"标题: {title}\n\n描述: 这是一个B站视频，无法获取完整内容。请直接观看视频。"
+            
+            logger.debug(f"[JinaSum] Successfully extracted content via newspaper, length: {len(full_content)}")
+            return full_content
             
         except Exception as e:
             logger.error(f"[JinaSum] Error extracting content via newspaper: {str(e)}")
@@ -238,38 +401,39 @@ class JinaSum(Plugin):
             target_url = html.unescape(content)
             target_url_content = None
             
-            # 1. 首先尝试使用newspaper提取
+            # 检查是否包含XML数据（分享消息错误）
+            if target_url.startswith("<") and "appmsg" in target_url:
+                logger.warning("[JinaSum] 检测到XML数据而不是URL，尝试提取真实URL")
+                try:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(target_url)
+                    url_elem = root.find(".//url")
+                    if url_elem is not None and url_elem.text:
+                        target_url = url_elem.text
+                        logger.debug(f"[JinaSum] 从XML中提取到URL: {target_url}")
+                    else:
+                        logger.error("[JinaSum] 无法从XML中提取URL")
+                        raise ValueError("无法从分享卡片中提取URL")
+                except Exception as ex:
+                    logger.error(f"[JinaSum] 解析XML失败: {str(ex)}")
+                    raise ValueError("无法从分享卡片中提取URL")
+            
+            # 使用newspaper3k提取内容
+            logger.debug(f"[JinaSum] 使用newspaper3k提取内容: {target_url}")
             target_url_content = self._get_content_via_newspaper(target_url)
             
-            # 2. 如果newspaper失败,对于微信文章尝试其他方法
-            if not target_url_content and "mp.weixin.qq.com" in target_url:
-                try:
-                    # 尝试jina方法
-                    jina_url = self._get_jina_url(target_url)
-                    logger.debug(f"[JinaSum] Requesting jina url: {jina_url}")
-                    
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-                    response = requests.get(jina_url, headers=headers, timeout=60)
-                    response.raise_for_status()
-                    target_url_content = response.text
-                    
-                    if not target_url_content or len(target_url_content) < 1000:
-                        # 内容太少,尝试API方法
-                        logger.debug(f"[JinaSum] Content from jina too short ({len(target_url_content)} chars), trying API")
-                        api_content = self._get_content_via_api(target_url)
-                        if api_content:
-                            target_url_content = api_content
-                    
-                except Exception as e:
-                    logger.error(f"[JinaSum] Failed to get content from jina reader: {str(e)}")
-                    # 尝试API方法
-                    api_content = self._get_content_via_api(target_url)
-                    if api_content:
-                        target_url_content = api_content
+            # 如果newspaper提取失败，尝试使用API
+            if not target_url_content:
+                logger.debug(f"[JinaSum] newspaper提取失败，尝试API方法: {target_url}")
+                target_url_content = self._get_content_via_api(target_url)
             
             # 如果所有方法都失败
             if not target_url_content:
-                raise ValueError("无法提取文章内容")
+                # 对于B站视频，提供特殊处理
+                if "bilibili.com" in target_url or "b23.tv" in target_url:
+                    target_url_content = "这是一个B站视频链接。由于视频内容无法直接提取，请直接点击链接观看视频。"
+                else:
+                    raise ValueError("无法提取文章内容")
                 
             # 清洗内容
             target_url_content = self._clean_content(target_url_content)
@@ -305,7 +469,7 @@ class JinaSum(Plugin):
             logger.error(f"[JinaSum] Error in processing summary: {str(e)}")
             if retry_count < 3:
                 logger.info(f"[JinaSum] Retrying {retry_count + 1}/3...")
-                return self._process_summary(content, e_context, retry_count + 1)
+                return self._process_summary(content, e_context, retry_count + 1, True)
             
             # 友好的错误提示
             error_msg = "抱歉，无法获取文章内容。可能是因为:\n"
@@ -392,51 +556,33 @@ class JinaSum(Plugin):
         return help_text
 
     def _load_config_template(self):
-        logger.debug("No Suno plugin config.json, use plugins/jina_sum/config.json.template")
+        """加载配置模板"""
         try:
-            plugin_config_path = os.path.join(self.path, "config.json.template")
-            if os.path.exists(plugin_config_path):
-                with open(plugin_config_path, "r", encoding="utf-8") as f:
+            template_path = os.path.join(os.path.dirname(__file__), "config.json.template")
+            if os.path.exists(template_path):
+                with open(template_path, "r", encoding="utf-8") as f:
                     plugin_conf = json.load(f)
                     return plugin_conf
         except Exception as e:
             logger.exception(e)
 
-    def _get_jina_url(self, target_url):
-        # 只对微信公众号链接做特殊处理
-        if "mp.weixin.qq.com" in target_url:
-            # 清理微信URL，只保留核心参数
-            import re
-            # 提取核心参数：__biz, mid, idx, sn
-            biz_match = re.search(r'__biz=([^&]+)', target_url)
-            mid_match = re.search(r'mid=([^&]+)', target_url)
-            idx_match = re.search(r'idx=([^&]+)', target_url)
-            sn_match = re.search(r'sn=([^&]+)', target_url)
-            
-            if biz_match and mid_match and idx_match and sn_match:
-                # 构建简化的URL
-                clean_url = f"http://mp.weixin.qq.com/s?__biz={biz_match.group(1)}&mid={mid_match.group(1)}&idx={idx_match.group(1)}&sn={sn_match.group(1)}"
-                logger.debug(f"[JinaSum] Simplified WeChat URL: {clean_url}")
-                target_url = clean_url
-            
-            # 对整个URL进行完全编码，不保留任何特殊字符
-            encoded_url = quote(target_url, safe='')
-            return self.jina_reader_base + "/" + encoded_url
-        else:
-            # 其他网站保持原有处理方式
-            return self.jina_reader_base + "/" + target_url
-
     def _get_openai_chat_url(self):
         return self.open_ai_api_base + "/chat/completions"
 
     def _get_openai_headers(self):
+        """获取openai的header"""
+        config = super().get_config()
         return {
-            'Authorization': f"Bearer {self.open_ai_api_key}",
-            'Host': urlparse(self.open_ai_api_base).netloc
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.get('openai_api_key')}"
         }
 
     def _get_openai_payload(self, target_url_content):
-        target_url_content = target_url_content[:self.max_words] # 通过字符串长度简单行截
+        """构造openai的payload
+        
+        Args:
+            target_url_content: 网页内容
+        """
         sum_prompt = f"{self.prompt}\n\n'''{target_url_content}'''"
         messages = [{"role": "user", "content": sum_prompt}]
         payload = {
@@ -455,20 +601,63 @@ class JinaSum(Plugin):
             bool: URL是否有效且允许访问
         """
         stripped_url = target_url.strip()
+        logger.debug(f"[JinaSum] 检查URL: {stripped_url}")
+        
         # 简单校验是否是url
         if not stripped_url.startswith("http://") and not stripped_url.startswith("https://"):
+            logger.debug("[JinaSum] URL不以http://或https://开头，跳过")
             return False
+
+        # 检测一些常见的不适合总结的内容类型
+        skip_patterns = [
+            # 视频/音乐平台的非文章内容
+            r"(bilibili\.com|b23\.tv).*/video/", # B站视频
+            r"(youtube\.com|youtu\.be)/watch", # YouTube视频
+            r"(music\.163\.com|y\.qq\.com)/(song|playlist|album)", # 音乐
+            
+            # 文件链接
+            r"\.(pdf|doc|docx|ppt|pptx|xls|xlsx|zip|rar|7z)(\?|$)", # 文档和压缩包
+            
+            # 图片链接
+            r"\.(jpg|jpeg|png|gif|bmp|webp|svg)(\?|$)", # 图片
+            
+            # 地图
+            r"(map\.(baidu|google|qq)\.com)", # 地图
+            
+            # 工具类
+            r"(docs\.qq\.com|shimo\.im|yuque\.com|notion\.so)", # 在线文档
+            
+            # 社交媒体特定内容
+            r"weixin\.qq\.com/[^/]+/([^/]+/){2,}",  # 微信小程序或其他功能
+            r"(weibo\.com|t\.cn)/[^/]+/[^/]+",  # 微博
+            
+            # 商城商品
+            r"(taobao\.com|tmall\.com|jd\.com)/.*?(item|product)",  # 电商商品
+            
+            # 小程序
+            r"servicewechat\.com"  # 微信小程序
+        ]
+        
+        # 使用正则表达式检查
+        import re
+        for pattern in skip_patterns:
+            if re.search(pattern, stripped_url, re.IGNORECASE):
+                logger.debug(f"[JinaSum] URL匹配跳过模式: {pattern}")
+                return False
 
         # 检查白名单
         if len(self.white_url_list):
             if not any(stripped_url.startswith(white_url) for white_url in self.white_url_list):
+                logger.debug("[JinaSum] URL不在白名单中")
                 return False
 
         # 排除黑名单，黑名单优先级>白名单
         for black_url in self.black_url_list:
             if stripped_url.startswith(black_url):
+                logger.debug(f"[JinaSum] URL在黑名单中: {black_url}")
                 return False
 
+        logger.debug("[JinaSum] URL检查通过")
         return True
 
     def _clean_content(self, content: str) -> str:
