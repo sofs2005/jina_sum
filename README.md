@@ -71,3 +71,9 @@ Dify on WeChat项目插件, 使用newspaper3k和ChatGPT总结网页链接内容
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=sofs2005/jina_sum&type=Date)](https://star-history.com/#sofs2005/jina_sum&Date)
+
+## 打赏支持
+
+如果您觉得这个插件对您有帮助，欢迎扫描下方二维码进行打赏支持，让我能够持续改进和开发更多实用功能。
+
+![微信打赏码](https://github.com/sofs2005/difytask/raw/main/img/wx.png?raw=true)
