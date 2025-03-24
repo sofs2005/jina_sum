@@ -22,7 +22,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="Sum url link content with newspaper3k and llm",
-    version="2.1",
+    version="2.2",
     author="sofs2005",
 )
 class JinaSum(Plugin):
@@ -577,25 +577,42 @@ class JinaSum(Plugin):
             # 构造提示词和内容
             sum_prompt = f"{self.prompt}\n\n'''{target_url_content}'''"
             
-            # 修改context内容
-            e_context['context'].type = ContextType.TEXT
-            e_context['context'].content = sum_prompt
-            
             try:
-                # 设置默认reply
-                default_reply = Reply(ReplyType.TEXT, "抱歉，处理过程中出现错误")
-                e_context["reply"] = default_reply
+                # 直接使用Bridge调用后台获取回复
+                from bridge.bridge import Bridge
                 
-                # 继续传递给下一个插件处理
-                e_context.action = EventAction.CONTINUE
-                logger.debug(f"[JinaSum] Passing content to next plugin: length={len(sum_prompt)}")
+                # 修改context内容
+                e_context['context'].type = ContextType.TEXT
+                e_context['context'].content = sum_prompt
+                
+                # 使用Bridge调用后台模型
+                logger.debug(f"[JinaSum] 使用Bridge直接调用后台模型，prompt长度={len(sum_prompt)}")
+                bridge = Bridge()
+                reply_content = bridge.fetch_reply_content(sum_prompt, e_context['context'])
+                
+                # 检查返回内容
+                if reply_content and hasattr(reply_content, 'content'):
+                    reply = reply_content  # 如果返回的是Reply对象，直接使用
+                else:
+                    # 否则创建新的Reply对象
+                    if isinstance(reply_content, str):
+                        reply = Reply(ReplyType.TEXT, reply_content)
+                    else:
+                        reply = Reply(ReplyType.ERROR, "后台返回格式错误")
+                
+                # 设置回复并中断处理链
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                logger.debug(f"[JinaSum] 使用Bridge直接调用后台模型成功，回复类型={reply.type}，长度={len(reply.content) if reply.content else 0}")
                 return
                 
             except Exception as e:
-                logger.warning(f"[JinaSum] Failed to handle context: {str(e)}")
-                error_reply = Reply(ReplyType.ERROR, "处理过程中出现错误")
-                e_context["reply"] = error_reply
-                e_context.action = EventAction.BREAK_PASS
+                logger.warning(f"[JinaSum] 直接调用后台失败: {str(e)}", exc_info=True)
+                
+                # 如果直接调用失败，回退到插件链的方式
+                logger.debug("[JinaSum] 回退到使用插件链处理")
+                e_context.action = EventAction.CONTINUE
+                return
                 
         except Exception as e:
             logger.error(f"[JinaSum] Error in processing summary: {str(e)}")
