@@ -3,13 +3,16 @@ import json
 import os
 import html
 import re
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs, quote_plus
 import time
+import asyncio
+import nest_asyncio
 
 import requests
 from newspaper import Article
 import newspaper
 from bs4 import BeautifulSoup
+from requests_html import HTMLSession
 
 import plugins
 from bridge.context import ContextType
@@ -17,12 +20,18 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from plugins import *
 
+# 应用nest_asyncio以解决事件循环问题
+try:
+    nest_asyncio.apply()
+except Exception as e:
+    logger.warning(f"[JinaSum] 无法应用nest_asyncio: {str(e)}")
+
 @plugins.register(
     name="JinaSum",
     desire_priority=20,
     hidden=False,
     desc="Sum url link content with newspaper3k and llm",
-    version="2.2",
+    version="2.3",
     author="sofs2005",
 )
 class JinaSum(Plugin):
@@ -256,46 +265,6 @@ class JinaSum(Plugin):
         for k in expired_keys:
             del self.pending_messages[k]
 
-    def _get_content_via_api(self, url):
-        """通过API服务获取微信公众号内容
-        
-        当jina直接访问失败时，使用此备用方法
-        
-        Args:
-            url: 微信文章URL
-            
-        Returns:
-            str: 文章内容
-        """
-        try:
-            # 简单的API调用，参考sum4all插件实现
-            api_url = "https://ai.sum4all.site"
-            headers = {
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                "link": url,
-                "prompt": "",  # 不需要总结，只获取内容
-            }
-            
-            logger.debug(f"[JinaSum] Trying to get content via API: {url}")
-            response = requests.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            response_data = response.json()
-            if response_data.get("success"):
-                # 从API返回中提取原始内容
-                content = response_data.get("content", "")
-                if content:
-                    logger.debug(f"[JinaSum] Successfully got content via API, length: {len(content)}")
-                    return content
-            
-            logger.error(f"[JinaSum] API returned failure or empty content")
-            return None
-        except Exception as e:
-            logger.error(f"[JinaSum] Error getting content via API: {str(e)}")
-            return None
-
     def _get_content_via_newspaper(self, url):
         """使用newspaper3k库提取文章内容
         
@@ -486,6 +455,12 @@ class JinaSum(Plugin):
             
             if not full_content or len(full_content.strip()) < 50:
                 logger.debug("[JinaSum] No content extracted by newspaper")
+                
+                # 尝试使用通用内容提取方法
+                full_content = self._extract_content_general(url, headers)
+                if full_content:
+                    return full_content
+                    
                 return None
             
             # 对于B站视频，尝试获取视频描述
@@ -499,9 +474,606 @@ class JinaSum(Plugin):
             
         except Exception as e:
             logger.error(f"[JinaSum] Error extracting content via newspaper: {str(e)}")
+            
+            # 尝试使用通用内容提取方法作为备用
+            try:
+                logger.debug(f"[JinaSum] 尝试使用通用内容提取方法")
+                content = self._extract_content_general(url)
+                if content:
+                    return content
+            except Exception as general_error:
+                logger.error(f"[JinaSum] 通用内容提取也失败: {str(general_error)}")
+            
             if "mp.weixin.qq.com" in url:
                 return f"无法获取微信公众号文章内容。可能原因：\n1. 文章需要登录才能查看\n2. 文章已被删除\n3. 服务器被微信风控\n\n请尝试直接打开链接: {url}"
             return None
+
+    def _extract_content_general(self, url, headers=None):
+        """通用网页内容提取方法，支持静态和动态页面
+        
+        首先尝试静态提取（更快、更轻量），如果失败或内容太少再尝试动态提取（更慢但更强大）
+        
+        Args:
+            url: 网页URL
+            headers: 可选的请求头，如果为None则使用默认
+            
+        Returns:
+            str: 提取的内容，失败返回None
+        """
+        try:
+            import random
+            from bs4 import BeautifulSoup
+            
+            # 如果是百度文章链接，使用专门的处理方法
+            if "md.mbd.baidu.com" in url or "mbd.baidu.com" in url:
+                # 直接使用专门的百度文章提取方法
+                content = self._extract_baidu_article(url)
+                if content:
+                    return content
+            
+            # 如果没有提供headers，创建一个默认的
+            if not headers:
+                headers = self._get_default_headers()
+            
+            # 添加随机延迟以避免被检测为爬虫
+            time.sleep(random.uniform(0.5, 2))
+            
+            # 创建会话对象
+            session = requests.Session()
+            
+            # 设置基本cookies
+            session.cookies.update({
+                f"visit_id_{int(time.time())}": f"{random.randint(1000000, 9999999)}",
+                "has_visited": "1",
+            })
+            
+            # 发送请求获取页面
+            logger.debug(f"[JinaSum] 通用提取方法正在请求: {url}")
+            response = session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # 确保编码正确
+            if response.encoding == 'ISO-8859-1':
+                response.encoding = response.apparent_encoding
+                
+            # 使用BeautifulSoup解析HTML
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 移除无用元素
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'form', 'iframe']):
+                element.extract()
+            
+            # 寻找可能的标题
+            title = None
+            
+            # 尝试多种标题选择器
+            title_candidates = [
+                soup.select_one('h1'),  # 最常见的标题标签
+                soup.select_one('title'),  # HTML标题
+                soup.select_one('.title'),  # 常见的标题类
+                soup.select_one('.article-title'),  # 常见的文章标题类
+                soup.select_one('.post-title'),  # 博客标题
+                soup.select_one('[class*="title" i]'),  # 包含title的类
+            ]
+            
+            for candidate in title_candidates:
+                if candidate and candidate.text.strip():
+                    title = candidate.text.strip()
+                    break
+            
+            # 查找可能的内容元素
+            content_candidates = []
+            
+            # 1. 尝试找常见的内容容器
+            content_selectors = [
+                'article', 'main', '.content', '.article', '.post-content',
+                '[class*="content" i]', '[class*="article" i]', 
+                '.story', '.entry-content', '.post-body',
+                '#content', '#article', '.body'
+            ]
+            
+            for selector in content_selectors:
+                elements = soup.select(selector)
+                if elements:
+                    content_candidates.extend(elements)
+            
+            # 2. 如果没有找到明确的内容容器，寻找具有最多文本的div元素
+            if not content_candidates:
+                paragraphs = {}
+                # 查找所有段落和div
+                for elem in soup.find_all(['p', 'div']):
+                    text = elem.get_text(strip=True)
+                    # 只考虑有实际内容的元素
+                    if len(text) > 100:
+                        paragraphs[elem] = len(text)
+                
+                # 找出文本最多的元素
+                if paragraphs:
+                    max_elem = max(paragraphs.items(), key=lambda x: x[1])[0]
+                    # 如果是div，直接添加；如果是p，尝试找其父元素
+                    if max_elem.name == 'div':
+                        content_candidates.append(max_elem)
+                    else:
+                        # 找包含多个段落的父元素
+                        parent = max_elem.parent
+                        if parent and len(parent.find_all('p')) > 3:
+                            content_candidates.append(parent)
+                        else:
+                            content_candidates.append(max_elem)
+            
+            # 3. 简单算法来评分和选择最佳内容元素
+            best_content = None
+            max_score = 0
+            
+            for element in content_candidates:
+                # 计算文本长度
+                text = element.get_text(strip=True)
+                text_length = len(text)
+                
+                # 计算文本密度（文本长度/HTML长度）
+                html_length = len(str(element))
+                text_density = text_length / html_length if html_length > 0 else 0
+                
+                # 计算段落数量
+                paragraphs = element.find_all('p')
+                paragraph_count = len(paragraphs)
+                
+                # 检查是否有图片
+                images = element.find_all('img')
+                image_count = len(images)
+                
+                # 根据各种特征计算分数
+                score = (
+                    text_length * 1.0 +  # 文本长度很重要
+                    text_density * 100 +  # 文本密度很重要
+                    paragraph_count * 30 +  # 段落数量也很重要
+                    image_count * 10  # 图片不太重要，但也是一个指标
+                )
+                
+                # 减分项：如果包含许多链接，可能是导航或侧边栏
+                links = element.find_all('a')
+                link_text_ratio = sum(len(a.get_text(strip=True)) for a in links) / text_length if text_length > 0 else 0
+                if link_text_ratio > 0.5:  # 如果链接文本占比过高
+                    score *= 0.5
+                
+                # 更新最佳内容
+                if score > max_score:
+                    max_score = score
+                    best_content = element
+            
+            # 如果找到内容，提取并清理文本
+            static_content_result = None
+            if best_content:
+                # 首先移除内容中可能的广告或无关元素
+                for ad in best_content.select('[class*="ad" i], [class*="banner" i], [id*="ad" i], [class*="recommend" i]'):
+                    ad.extract()
+                
+                # 获取并清理文本
+                content_text = best_content.get_text(separator='\n', strip=True)
+                
+                # 移除多余的空白行
+                content_text = re.sub(r'\n{3,}', '\n\n', content_text)
+                
+                # 构建最终输出
+                result = ""
+                if title:
+                    result += f"标题: {title}\n\n"
+                
+                result += content_text
+                
+                logger.debug(f"[JinaSum] 通用提取方法成功，提取内容长度: {len(result)}")
+                static_content_result = result
+            
+            # 判断静态提取的内容质量
+            content_is_good = False
+            if static_content_result:
+                # 内容长度检查
+                if len(static_content_result) > 1000:
+                    content_is_good = True
+                # 结构检查 - 至少应该有多个段落
+                elif static_content_result.count('\n\n') >= 3:
+                    content_is_good = True
+            
+            # 如果静态提取内容质量不佳，尝试动态提取
+            if not content_is_good:
+                logger.debug("[JinaSum] 静态提取内容质量不佳，尝试动态提取")
+                dynamic_content = self._extract_dynamic_content(url, headers)
+                if dynamic_content:
+                    logger.debug(f"[JinaSum] 动态提取成功，内容长度: {len(dynamic_content)}")
+                    return dynamic_content
+            
+            return static_content_result
+                
+        except Exception as e:
+            logger.error(f"[JinaSum] 通用内容提取方法失败: {str(e)}", exc_info=True)
+            return None
+
+    def _extract_dynamic_content(self, url, headers=None):
+        """使用JavaScript渲染提取动态页面内容
+        
+        Args:
+            url: 网页URL
+            headers: 可选的请求头
+            
+        Returns:
+            str: 提取的内容，失败返回None
+        """
+        try:
+            from requests_html import HTMLSession
+            from bs4 import BeautifulSoup
+            
+            logger.debug(f"[JinaSum] 开始动态提取内容: {url}")
+            
+            # 创建会话并设置超时
+            session = HTMLSession()
+            
+            # 添加请求头
+            req_headers = headers or self._get_default_headers()
+            
+            # 获取页面
+            response = session.get(url, headers=req_headers, timeout=30)
+            
+            # 执行JavaScript (设置超时，防止无限等待)
+            logger.debug("[JinaSum] 开始执行JavaScript")
+            response.html.render(timeout=20, sleep=2)
+            logger.debug("[JinaSum] JavaScript执行完成")
+            
+            # 处理渲染后的HTML
+            rendered_html = response.html.html
+            
+            # 使用BeautifulSoup解析渲染后的HTML
+            soup = BeautifulSoup(rendered_html, 'html.parser')
+            
+            # 清理无用元素
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                element.extract()
+            
+            # 查找标题
+            title = None
+            title_candidates = [
+                soup.select_one('h1'),
+                soup.select_one('title'),
+                soup.select_one('.title'),
+                soup.select_one('[class*="title" i]'),
+            ]
+            
+            for candidate in title_candidates:
+                if candidate and candidate.text.strip():
+                    title = candidate.text.strip()
+                    break
+            
+            # 寻找主要内容
+            main_content = None
+            
+            # 1. 尝试找主要内容容器
+            main_selectors = [
+                'article', 'main', '.content', '.article',
+                '[class*="content" i]', '[class*="article" i]',
+                '#content', '#article'
+            ]
+            
+            for selector in main_selectors:
+                elements = soup.select(selector)
+                if elements:
+                    # 选择包含最多文本的元素
+                    main_content = max(elements, key=lambda x: len(x.get_text()))
+                    break
+            
+            # 2. 如果没找到，寻找文本最多的div
+            if not main_content:
+                paragraphs = {}
+                for elem in soup.find_all(['div']):
+                    text = elem.get_text(strip=True)
+                    if len(text) > 200:  # 只考虑长文本
+                        paragraphs[elem] = len(text)
+                
+                if paragraphs:
+                    main_content = max(paragraphs.items(), key=lambda x: x[1])[0]
+            
+            # 3. 如果还是没找到，使用整个body
+            if not main_content:
+                main_content = soup.body
+            
+            # 从主要内容中提取文本
+            if main_content:
+                # 清理可能的广告或无关元素
+                for ad in main_content.select('[class*="ad" i], [class*="banner" i], [id*="ad" i], [class*="recommend" i]'):
+                    ad.extract()
+                
+                # 获取文本
+                content_text = main_content.get_text(separator='\n', strip=True)
+                content_text = re.sub(r'\n{3,}', '\n\n', content_text)  # 清理多余空行
+                
+                # 构建最终结果
+                result = ""
+                if title:
+                    result += f"标题: {title}\n\n"
+                result += content_text
+                
+                # 关闭会话
+                session.close()
+                
+                return result
+            
+            # 关闭会话
+            session.close()
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"[JinaSum] 动态提取失败: {str(e)}", exc_info=True)
+            return None
+
+    def _extract_baidu_article(self, url):
+        """专门用于提取百度文章内容的方法
+        
+        Args:
+            url: 百度文章URL
+            
+        Returns:
+            str: 提取的内容，失败返回None
+        """
+        try:
+            import random
+            import json
+            from bs4 import BeautifulSoup
+            
+            logger.debug(f"[JinaSum] 尝试专门提取百度文章: {url}")
+            
+            # 提取文章ID
+            article_id = None
+            parsed_url = urlparse(url)
+            path_parts = parsed_url.path.split('/')
+            
+            # 例如 /r/1A1GKWoodMI
+            if len(path_parts) > 1 and path_parts[-2] == 'r':
+                article_id = path_parts[-1]
+            
+            # 例如 ?r=1A1GKWoodMI
+            if not article_id:
+                query_params = parse_qs(parsed_url.query)
+                if 'r' in query_params:
+                    article_id = query_params['r'][0]
+            
+            if not article_id:
+                logger.error(f"[JinaSum] 无法从URL提取百度文章ID: {url}")
+                return None
+                
+            logger.debug(f"[JinaSum] 提取到百度文章ID: {article_id}")
+            
+            # 构建多种URL尝试提取
+            url_formats = [
+                # 尝试直接访问原始URL
+                url,
+                # 尝试移动网页版格式1
+                f"https://mbd.baidu.com/newspage/data/landingshare?context=%7B%22nid%22%3A%22news_{article_id}%22%2C%22sourceFrom%22%3A%22bjh%22%7D",
+                # 尝试移动网页版格式2
+                f"https://mbd.baidu.com/newspage/data/landingsuper?context=%7B%22nid%22%3A%22news_{article_id}%22%7D"
+            ]
+            
+            # 使用移动设备UA
+            mobile_user_agents = [
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
+                "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+                "Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/94.0.4606.76 Mobile/15E148 Safari/604.1"
+            ]
+            
+            # 尝试每种URL格式
+            for target_url in url_formats:
+                try:
+                    logger.debug(f"[JinaSum] 尝试百度文章URL格式: {target_url}")
+                    
+                    # 构建请求头
+                    headers = {
+                        "User-Agent": random.choice(mobile_user_agents),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Connection": "keep-alive",
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache"
+                    }
+                    
+                    # 发送请求
+                    response = requests.get(
+                        target_url, 
+                        headers=headers, 
+                        timeout=15,
+                        allow_redirects=True
+                    )
+                    response.raise_for_status()
+                    
+                    # 确保编码正确
+                    if response.encoding == 'ISO-8859-1':
+                        response.encoding = response.apparent_encoding
+                    
+                    # 检查是否是JSON响应 - 某些百度API会返回JSON
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' in content_type or response.text.strip().startswith('{'):
+                        try:
+                            data = json.loads(response.text)
+                            # 检查JSON数据中是否包含文章内容
+                            if data.get('data', {}).get('title') and (data.get('data', {}).get('content') or data.get('data', {}).get('html')):
+                                title = data['data']['title']
+                                content_html = data['data'].get('content', '') or data['data'].get('html', '')
+                                author = data['data'].get('author', '')
+                                publish_time = data['data'].get('publish_time', '')
+                                
+                                # 解析HTML内容
+                                content_soup = BeautifulSoup(content_html, 'html.parser')
+                                
+                                # 移除脚本和样式
+                                for tag in content_soup(['script', 'style']):
+                                    tag.decompose()
+                                
+                                # 提取纯文本
+                                content_text = content_soup.get_text(separator='\n', strip=True)
+                                
+                                # 构建结果
+                                result = f"标题: {title}\n"
+                                if author:
+                                    result += f"作者: {author}\n"
+                                if publish_time:
+                                    result += f"时间: {publish_time}\n"
+                                    
+                                result += f"\n{content_text}"
+                                
+                                logger.debug(f"[JinaSum] 成功通过JSON提取百度文章，长度: {len(result)}")
+                                return result
+                        except json.JSONDecodeError:
+                            # 不是JSON，继续当作HTML处理
+                            pass
+                    
+                    # 解析HTML
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # 先尝试提取可能的JSON数据
+                    # 百度有时会在页面中嵌入文章JSON数据
+                    for script in soup.find_all('script'):
+                        script_text = script.string
+                        if script_text and ('content' in script_text or 'article' in script_text):
+                            try:
+                                # 尝试找到JSON格式的数据
+                                json_start = script_text.find('{')
+                                json_end = script_text.rfind('}') + 1
+                                if json_start >= 0 and json_end > json_start:
+                                    json_str = script_text[json_start:json_end]
+                                    data = json.loads(json_str)
+                                    
+                                    # 检查是否包含文章数据
+                                    article_data = None
+                                    if 'article' in data:
+                                        article_data = data['article']
+                                    elif 'data' in data and 'article' in data['data']:
+                                        article_data = data['data']['article']
+                                    
+                                    if article_data and 'title' in article_data:
+                                        title = article_data.get('title', '')
+                                        content = article_data.get('content', '')
+                                        author = article_data.get('author', '')
+                                        publish_time = article_data.get('publish_time', '')
+                                        
+                                        # 解析HTML内容
+                                        if content:
+                                            content_soup = BeautifulSoup(content, 'html.parser')
+                                            content_text = content_soup.get_text(separator='\n', strip=True)
+                                            
+                                            # 构建结果
+                                            result = f"标题: {title}\n"
+                                            if author:
+                                                result += f"作者: {author}\n"
+                                            if publish_time:
+                                                result += f"时间: {publish_time}\n"
+                                                
+                                            result += f"\n{content_text}"
+                                            
+                                            logger.debug(f"[JinaSum] 成功从嵌入JSON提取百度文章，长度: {len(result)}")
+                                            return result
+                            except Exception as json_err:
+                                logger.debug(f"[JinaSum] 从脚本提取JSON失败: {str(json_err)}")
+                    
+                    # 尝试从HTML直接提取内容
+                    # 提取标题
+                    title = None
+                    for selector in ['.article-title', '.title', 'h1.title', 'h1']:
+                        title_elem = soup.select_one(selector)
+                        if title_elem and title_elem.text.strip():
+                            title = title_elem.text.strip()
+                            break
+                    
+                    # 如果没找到标题，尝试使用标题标签
+                    if not title:
+                        title_tag = soup.find('title')
+                        if title_tag:
+                            title = title_tag.text.strip()
+                    
+                    # 提取作者
+                    author = None
+                    for selector in ['.author', '.writer', '.source', '.article-author']:
+                        author_elem = soup.select_one(selector)
+                        if author_elem and author_elem.text.strip():
+                            author = author_elem.text.strip()
+                            break
+                    
+                    # 提取内容
+                    content = None
+                    for selector in ['.article-content', '.article-detail', '.content', '.artcle', '#article']:
+                        content_elem = soup.select_one(selector)
+                        if content_elem:
+                            # 移除无用元素
+                            for remove_elem in content_elem.select('.ad-banner, .recommend, .share-btn, script, style'):
+                                remove_elem.extract()
+                            
+                            content_text = content_elem.get_text(separator='\n', strip=True)
+                            if len(content_text) > 200:  # 内容足够长
+                                content = content_text
+                                break
+                    
+                    # 如果没找到内容，尝试查找最长的段落集合
+                    if not content:
+                        max_paragraphs = []
+                        max_text_len = 0
+                        
+                        # 查找所有可能的内容容器
+                        for div in soup.find_all('div'):
+                            paragraphs = div.find_all('p')
+                            if len(paragraphs) >= 3:  # 至少有3个段落
+                                text = '\n'.join([p.get_text(strip=True) for p in paragraphs])
+                                if len(text) > max_text_len:
+                                    max_text_len = len(text)
+                                    max_paragraphs = paragraphs
+                        
+                        # 如果找到足够长的段落集合
+                        if max_text_len > 200:
+                            content = '\n'.join([p.get_text(strip=True) for p in max_paragraphs])
+                    
+                    # 如果找到内容，构建结果
+                    if content:
+                        result = ""
+                        if title:
+                            result += f"标题: {title}\n"
+                        if author:
+                            result += f"作者: {author}\n"
+                        result += f"\n{content}"
+                        
+                        logger.debug(f"[JinaSum] 成功通过HTML提取百度文章，长度: {len(result)}")
+                        return result
+                
+                except Exception as e:
+                    logger.debug(f"[JinaSum] 尝试URL {target_url} 失败: {str(e)}")
+                    continue  # 尝试下一个URL格式
+            
+            # 所有尝试都失败，返回None
+            logger.error(f"[JinaSum] 所有百度文章提取方法均失败")
+            return None
+            
+        except Exception as e:
+            logger.error(f"[JinaSum] 专门提取百度文章失败: {str(e)}")
+            return None
+
+    def _get_default_headers(self):
+        """获取默认请求头"""
+        import random
+        
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+        ]
+        selected_ua = random.choice(user_agents)
+        
+        return {
+            "User-Agent": selected_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "max-age=0",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1"
+        }
 
     def _process_summary(self, content: str, e_context: EventContext, retry_count: int = 0, skip_notice: bool = False):
         """处理总结请求"""
@@ -554,10 +1126,10 @@ class JinaSum(Plugin):
                 e_context.action = EventAction.BREAK_PASS
                 return
             
-            # 如果newspaper提取失败，尝试使用API
+            # 如果newspaper提取失败，直接使用通用提取方法
             if not target_url_content:
-                logger.debug(f"[JinaSum] newspaper提取失败，尝试API方法: {target_url}")
-                target_url_content = self._get_content_via_api(target_url)
+                logger.debug(f"[JinaSum] newspaper提取失败，直接使用通用提取方法: {target_url}")
+                target_url_content = self._extract_content_general(target_url)
             
             # 如果所有方法都失败
             if not target_url_content:
