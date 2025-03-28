@@ -240,15 +240,6 @@ class JinaSum(Plugin):
                 logger.debug("[JinaSum] No content to summarize")
                 return
 
-            # 处理"问xxx"格式的追问
-            if content.startswith("问"):
-                question = content[1:].strip()
-                if question:
-                    logger.debug(f"[JinaSum] Processing question: {question}")
-                    return self._process_question(question, chat_id, e_context)
-                else:
-                    logger.debug("[JinaSum] Empty question, ignored")
-                    return
                     
             # 单聊中直接处理URL
             if not is_group and self._check_url(content):
@@ -1206,59 +1197,7 @@ class JinaSum(Plugin):
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
 
-    def _process_question(self, question: str, chat_id: str, e_context: EventContext, retry_count: int = 0):
-        """处理用户提问"""
-        try:
-            # 获取最近总结的内容
-            recent_content = None
-            recent_timestamp = 0
-            
-            # 遍历所有缓存找到最近总结的内容
-            for url, cache_data in self.content_cache.items():
-                if cache_data["timestamp"] > recent_timestamp:
-                    recent_timestamp = cache_data["timestamp"]
-                    recent_content = cache_data["content"]
-            
-            if not recent_content or time.time() - recent_timestamp > self.content_cache_timeout:
-                logger.debug(f"[JinaSum] No valid content cache found or content expired")
-                return  # 找不到相关文章，让后续插件处理问题
-            
-            if retry_count == 0:
-                reply = Reply(ReplyType.TEXT, "🤔 正在思考您的问题，请稍候...")
-                channel = e_context["channel"]
-                channel.send(reply, e_context["context"])
-
-            # 准备问答请求
-            openai_chat_url = self._get_openai_chat_url()
-            openai_headers = self._get_openai_headers()
-            
-            # 构建问答的 prompt
-            qa_prompt = self.qa_prompt.format(
-                content=recent_content[:self.max_words],
-                question=question
-            )
-            
-            openai_payload = {
-                'model': self.open_ai_model,
-                'messages': [{"role": "user", "content": qa_prompt}]
-            }
-            
-            # 调用 API 获取回答
-            response = requests.post(openai_chat_url, headers=openai_headers, json=openai_payload, timeout=60)
-            response.raise_for_status()
-            answer = response.json()['choices'][0]['message']['content']
-            
-            reply = Reply(ReplyType.TEXT, answer)
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
-            
-        except Exception as e:
-            logger.error(f"[JinaSum] Error in processing question: {str(e)}")
-            if retry_count < 3:
-                return self._process_question(question, chat_id, e_context, retry_count + 1)
-            reply = Reply(ReplyType.ERROR, f"抱歉，处理您的问题时出错: {str(e)}")
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
+    
 
     def get_help_text(self, verbose, **kwargs):
         help_text = "网页内容总结插件:\n"
@@ -1272,7 +1211,6 @@ class JinaSum(Plugin):
                 help_text += "\n"
         else:
             help_text += "3. 群聊中收到分享消息后，发送包含「总结」的消息即可触发总结\n"
-        help_text += f"4. 总结完成后5分钟内，可以发送「{self.qa_trigger}xxx」来询问文章相关问题\n"
         help_text += "注：群聊中的分享消息的总结请求需要在60秒内发出"
         return help_text
 
