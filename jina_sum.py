@@ -1140,50 +1140,20 @@ class JinaSum(Plugin):
             # 构造提示词和内容
             sum_prompt = f"{self.prompt}\n\n'''{target_url_content}'''"
             
-            try:
-                # 直接使用Bridge调用后台获取回复
-                from bridge.bridge import Bridge
-                
-                # 修改context内容
-                e_context['context'].type = ContextType.TEXT
-                e_context['context'].content = sum_prompt
-                
-                # 使用Bridge调用后台模型
-                logger.debug(f"[JinaSum] 使用Bridge直接调用后台模型，prompt长度={len(sum_prompt)}")
-                bridge = Bridge()
-                reply_content = bridge.fetch_reply_content(sum_prompt, e_context['context'])
-                
-                # 检查返回内容
-                if reply_content and hasattr(reply_content, 'content'):
-                    reply = reply_content  # 如果返回的是Reply对象，直接使用
-                else:
-                    # 否则创建新的Reply对象
-                    if isinstance(reply_content, str):
-                        reply = Reply(ReplyType.TEXT, reply_content)
-                    else:
-                        reply = Reply(ReplyType.ERROR, "后台返回格式错误")
-                
-                # 设置回复并中断处理链
-                e_context["reply"] = reply
-                e_context.action = EventAction.BREAK_PASS
-                logger.debug(f"[JinaSum] 使用Bridge直接调用后台模型成功，回复类型={reply.type}，长度={len(reply.content) if reply.content else 0}")
-                return
-                
-            except Exception as e:
-                logger.warning(f"[JinaSum] 直接调用后台失败: {str(e)}", exc_info=True)
-                
-                # 如果直接调用失败，回退到插件链的方式
-                logger.debug("[JinaSum] 回退到使用插件链处理")
-                e_context.action = EventAction.CONTINUE
-                return
+            # 修改context内容，使用传递式消息
+            e_context['context'].type = ContextType.TEXT
+            e_context['context'].content = sum_prompt
+            e_context.action = EventAction.CONTINUE
+            logger.debug("[JinaSum] 使用传递式消息处理")
+            return
                 
         except Exception as e:
             logger.error(f"[JinaSum] Error in processing summary: {str(e)}")
+            
             if retry_count < 3:
                 logger.info(f"[JinaSum] Retrying {retry_count + 1}/3...")
                 return self._process_summary(content, e_context, retry_count + 1, True)
             
-            # 友好的错误提示
             error_msg = "抱歉，无法获取文章内容。可能是因为:\n"
             error_msg += "1. 文章需要登录或已过期\n"
             error_msg += "2. 文章有特殊的访问限制\n"
@@ -1196,8 +1166,6 @@ class JinaSum(Plugin):
             reply = Reply(ReplyType.ERROR, error_msg)
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
-
-    
 
     def get_help_text(self, verbose, **kwargs):
         help_text = "网页内容总结插件:\n"
